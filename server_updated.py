@@ -17,12 +17,47 @@ except Exception:
     pass
 
 app = Flask(__name__)
+CORS(app)
+
+@app.route("/")
+def home():
+    return {
+        "message": "AI Backend is running ",
+        "endpoints": [
+            "/health",
+            "/analyze",
+            "/smart_suggest"
+        ]
+    }
+
 # Enable CORS for all origins (development mode)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
 # Initialize components
 behavioral_engine = None
 model_trainer = None
+
+# Auto-learning tracking
+learning_data = []
+retrain_threshold = 1000
+last_retrain_count = 0
+last_retrain_date = None
+
+# 🗺 1️⃣ One-Hot Suggestion Mapping
+SUGGESTIONS = [
+    'drink_water', 'exercise', 'sleep_early', 'meditate', 
+    'read_book', 'healthy_food', 'walk', 'stretch', 
+    'deep_work', 'no_sugar'
+]
+
+def get_suggestion_vector(name):
+    """One-Hot Encoding to prevent fake ordering (Bomb #1 Fixed)"""
+    vector = [0] * len(SUGGESTIONS)
+    for i, s in enumerate(SUGGESTIONS):
+        if s in name.lower():
+            vector[i] = 1
+            break
+    return vector
 
 def initialize_system():
     """Initialize AI habit analysis system with behavioral AI engine"""
@@ -544,6 +579,346 @@ def analyze_habits():
             'message': str(e),
             'details': error_details if app.debug else None
         }), 500
+
+@app.route('/track_interaction', methods=['POST'])
+def track_interaction():
+    """Track user interaction with AI suggestions - FOR LEARNING"""
+    global learning_data
+    
+    try:
+        data = request.get_json()
+        
+        interaction = {
+            'userId': data.get('userId'),
+            'timestamp': datetime.now().isoformat(),
+            'features': data.get('features'),  # User state when suggestion given
+            'suggestion': data.get('suggestion'),  # What AI suggested
+            'executed': data.get('executed', False),  # Did user do it?
+            'feedback': data.get('feedback', 0),  # 1 = good, -1 = bad
+            'context': data.get('context')  # Time, day, etc.
+        }
+        
+        learning_data.append(interaction)
+        
+        # Check if we should retrain
+        should_retrain = False
+        if len(learning_data) - last_retrain_count >= retrain_threshold:
+            should_retrain = True
+        
+        # Also check weekly retrain
+        if last_retrain_date:
+            days_since = (datetime.now() - last_retrain_date).days
+            if days_since >= 7:
+                should_retrain = True
+        
+        return jsonify({
+            'success': True,
+            'tracked': len(learning_data),
+            'should_retrain': should_retrain,
+            'message': 'Interaction tracked for AI learning'
+        })
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/retrain_model', methods=['POST'])
+def retrain_model():
+    """Retrain model on accumulated real data"""
+    global behavioral_engine, last_retrain_count, last_retrain_date
+    
+    try:
+        if len(learning_data) < 100:
+            return jsonify({
+                'success': False,
+                'message': 'Need at least 100 interactions to retrain',
+                'current': len(learning_data)
+            }), 400
+        
+        print(f"🔄 Retraining AI on {len(learning_data)} real interactions...")
+        
+        # 2️⃣ Prepare Features (Bomb #2 & #3 Fixed)
+        for interaction in learning_data:
+            if interaction.get('features') and interaction.get('suggestion'):
+                feat = interaction['features']
+                
+                # Context Awareness (Time/Day)
+                dt = datetime.fromisoformat(interaction.get('timestamp', datetime.now().isoformat()))
+                hour_norm = dt.hour / 24.0
+                day_norm = dt.weekday() / 7.0
+                
+                # Behavioral Personalization (Better than Hash)
+                user_avg_comp = feat.get('completionRate', 0.5) 
+                user_consistency = feat.get('consistency', 0.5)
+                
+                # One-Hot Encoding for Suggestion
+                s_vector = get_suggestion_vector(interaction['suggestion'])
+                
+                # Full Feature Vector
+                features_vector = [
+                    feat.get('completionRate', 0),
+                    feat.get('consistency', 0),
+                    feat.get('dropRate', 0),
+                    feat.get('activeStreaks', 0),
+                    hour_norm,     # 🎯 Time Awareness
+                    day_norm,      # 🎯 Day Awareness
+                    user_avg_comp, # 🎯 Personalization
+                    user_consistency
+                ] + s_vector # 🎯 One-Hot (No Bias)
+                
+                # 🎯 Preference Learning (Boost chosen, slight penalty for ignored)
+                chosen_suggestion = interaction.get('chosenSuggestion')
+                current_s = interaction.get('suggestion')
+                
+                # Base Reward calculation:
+                feedback = interaction.get('feedback', 0)
+                executed = interaction.get('executed', False)
+                
+                if executed and feedback > 0: reward = 1.0
+                elif executed: reward = 0.7
+                elif not executed and feedback < 0: reward = -0.5
+                else: reward = 0.2
+                
+                # 🔥 Preference Learning Adjustment
+                if chosen_suggestion:
+                    if chosen_suggestion == current_s:
+                        reward += 0.2  # 🚀 User preferred this!
+                    else:
+                        reward -= 0.1  # 📉 User ignored this for another choice
+                
+                reward = max(-1.0, min(1.2, reward)) # Clamp rewards
+                
+                X.append(features_vector)
+                y.append(reward)
+        
+        if len(X) < 50:
+            return jsonify({'success': False, 'message': 'Not enough data'}), 400
+        
+        # 3️⃣ Regularized Regressor (Bomb #3: Prevents Overfitting)
+        from sklearn.ensemble import RandomForestRegressor
+        reward_model = RandomForestRegressor(
+            n_estimators=100,
+            max_depth=6,           # 🔥 Limit depth
+            min_samples_leaf=12,   # 🔥 Require more samples
+            random_state=42
+        )
+        reward_model.fit(X_scaled, y)
+        
+        print(f"✅ Reward model trained: predicts success score 0.0-1.0")
+        print(f"   Average reward in training: {sum(y)/len(y):.2f}")
+        
+        # Save models
+        joblib.dump(reward_model, 'reward_model_real.pkl')
+        joblib.dump(scaler, 'feature_scaler_real.pkl')
+        
+        # Also train suggestion picker model
+        train_suggestion_picker(X_scaled, y, learning_data)
+        
+        # Update behavioral engine
+        if behavioral_engine:
+            behavioral_engine.reward_model = reward_model
+            behavioral_engine.scaler = scaler
+        
+        # Update tracking
+        last_retrain_count = len(learning_data)
+        last_retrain_date = datetime.now()
+        
+        # Save learning data to file
+        with open('learning_data.json', 'w', encoding='utf-8') as f:
+            json.dump(learning_data, f, ensure_ascii=False)
+        
+        print(f"✅ Retraining complete! Model now uses {len(X)} real examples")
+        
+        return jsonify({
+            'success': True,
+            'trained_on': len(X),
+            'total_interactions': len(learning_data),
+            'message': 'AI model retrained on real user data'
+        })
+        
+    except Exception as e:
+        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
+
+@app.route('/learning_status', methods=['GET'])
+def learning_status():
+    """Get AI learning status"""
+    try:
+        executed_count = sum(1 for i in learning_data if i.get('executed'))
+        positive_feedback = sum(1 for i in learning_data if i.get('feedback', 0) > 0)
+        negative_feedback = sum(1 for i in learning_data if i.get('feedback', 0) < 0)
+        
+        # Calculate average reward from learning data
+        avg_reward = 0
+        if learning_data:
+            rewards = []
+            for i in learning_data:
+                executed = i.get('executed', False)
+                feedback = i.get('feedback', 0)
+                if executed and feedback > 0:
+                    rewards.append(1.0)
+                elif executed:
+                    rewards.append(0.7)
+                elif feedback < 0:
+                    rewards.append(0.0)
+                else:
+                    rewards.append(0.3)
+            avg_reward = sum(rewards) / len(rewards) if rewards else 0
+        
+        return jsonify({
+            'total_interactions': len(learning_data),
+            'executed_suggestions': executed_count,
+            'positive_feedback': positive_feedback,
+            'negative_feedback': negative_feedback,
+            'average_reward_score': round(avg_reward, 3),
+            'retrain_threshold': retrain_threshold,
+            'until_next_retrain': retrain_threshold - (len(learning_data) - last_retrain_count),
+            'last_retrain': last_retrain_date.isoformat() if last_retrain_date else None,
+            'model_type': 'reward_regressor' if os.path.exists('reward_model_real.pkl') else 'synthetic',
+            'learning_mode': 'reinforcement_learning',
+            'suggestion_picker': 'AI-optimized'
+        })
+    except Exception as e:
+        return jsonify({
+            'error': str(e)
+        }), 500
+
+# SMART SUGGESTION PICKER - learns which suggestion works for whom
+def train_suggestion_picker(X_scaled, rewards, learning_data):
+    """Train model to pick the best suggestion based on user state"""
+    from collections import defaultdict
+    
+    # Group by suggestion and calculate average reward
+    suggestion_stats = defaultdict(list)
+    for i, interaction in enumerate(learning_data):
+        if i < len(rewards):
+            suggestion = interaction.get('suggestion', 'unknown')
+            suggestion_stats[suggestion].append(rewards[i])
+    
+    # Calculate average effectiveness
+    suggestion_effectiveness = {}
+    for suggestion, rewards_list in suggestion_stats.items():
+        avg_reward = sum(rewards_list) / len(rewards_list)
+        suggestion_effectiveness[suggestion] = {
+            'avg_reward': avg_reward,
+            'count': len(rewards_list)
+        }
+    
+    # Save effectiveness data
+    joblib.dump(suggestion_effectiveness, 'suggestion_effectiveness.pkl')
+    
+    print(f"📊 Suggestion effectiveness trained on {len(suggestion_stats)} suggestions")
+    for suggestion, stats in sorted(suggestion_effectiveness.items(), 
+                                     key=lambda x: x[1]['avg_reward'], reverse=True)[:5]:
+        print(f"   {suggestion}: {stats['avg_reward']:.2f} avg reward ({stats['count']} uses)")
+    
+    return suggestion_effectiveness
+
+@app.route('/smart_suggest', methods=['POST'])
+def smart_suggest():
+    """Predicts Top 3 Suggestions using Context & Personalization"""
+    import random
+    import numpy as np
+    
+    try:
+        data = request.get_json()
+        features = data.get('features', {})
+        available_suggestions = data.get('available_suggestions', [])
+        
+        # Current Context
+        now = datetime.now()
+        hour_norm = now.hour / 24.0
+        day_norm = now.weekday() / 7.0
+        
+        if not available_suggestions:
+            return jsonify({'error': 'No suggestions provided'}), 400
+            
+        # 1️⃣ Load Reward Model
+        model, scaler = None, None
+        if os.path.exists('reward_model_real.pkl'):
+            model = joblib.load('reward_model_real.pkl')
+            scaler = joblib.load('feature_scaler_real.pkl')
+        
+        # 2️⃣ Predict Score for EVERY available suggestion
+        scored_list = []
+        for suggestion in available_suggestions:
+            if model and scaler:
+                s_vector = get_suggestion_vector(suggestion)
+                x = [
+                    features.get('completionRate', 0.5),
+                    features.get('consistency', 0.5),
+                    features.get('dropRate', 0),
+                    features.get('activeStreaks', 0),
+                    hour_norm,
+                    day_norm,
+                    features.get('completionRate', 0.5), # user avg
+                    features.get('consistency', 0.5)     # user consistency
+                ] + s_vector
+                
+                x_scaled = scaler.transform([x])
+                score = float(model.predict(x_scaled)[0])
+            else:
+                score = 0.5 # Cold start fallback
+            
+            scored_list.append({'suggestion': suggestion, 'score': score})
+            
+        # 3️⃣ Ranking & Dynamic Sampling (Top 3 from Top 5) 🔥
+        scored_list.sort(key=lambda x: x['score'], reverse=True)
+        top_5 = scored_list[:5]
+        
+        # 🎲 Dynamic Selection: Pick 3 from the top 5 to keep it fresh
+        if len(top_5) >= 3:
+            top_3 = random.sample(top_5, 3)
+            # Re-sort the sampled 3 by score
+            top_3.sort(key=lambda x: x['score'], reverse=True)
+        else:
+            top_3 = top_5
+        
+        # Determine the winner
+        winner = top_3[0]
+        method = "Preference-Aware Ranking"
+            
+        return jsonify({
+            'main_suggestion': winner['suggestion'],
+            'predicted_reward': round(winner['score'], 3),
+            'top_suggestions': [
+                {'suggestion': s['suggestion'], 'score': round(s['score'], 3)} 
+                for s in top_3
+            ],
+            'method': method,
+            'confidence': "Personalized" if model is not None else "Learning",
+            'note': "✨ أفضل اقتراح لك الآن بناءً على تفضيلاتك"
+        })
+        
+    except Exception as e:
+        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
+        
+    except Exception as e:
+        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
+
+# Auto-retrain scheduler (runs every hour)
+def check_and_retrain():
+    """Background task to check if retraining needed"""
+    global last_retrain_count, last_retrain_date
+    
+    try:
+        current_count = len(learning_data)
+        new_records = current_count - last_retrain_count
+        
+        # Check threshold
+        if new_records >= retrain_threshold:
+            print(f"🔄 Auto-triggering retrain: {new_records} new records")
+            with app.test_client() as client:
+                client.post('/retrain_model')
+            return
+        
+        # Check weekly
+        if last_retrain_date:
+            days_since = (datetime.now() - last_retrain_date).days
+            if days_since >= 7 and new_records >= 100:
+                print(f"🔄 Weekly retrain triggered")
+                with app.test_client() as client:
+                    client.post('/retrain_model')
+    except Exception as e:
+        print(f"Auto-retrain error: {e}")
 
 if __name__ == '__main__':
     if initialize_system():

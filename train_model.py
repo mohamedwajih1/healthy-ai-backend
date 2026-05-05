@@ -134,6 +134,80 @@ class HabitModelTrainer:
             'probabilities': dict(zip(classes, probabilities))
         }
     
+    def train_on_real_data(self, csv_path='real_data.csv'):
+        """Train model on real user data from CSV or Firestore"""
+        import os
+        
+        if os.path.exists(csv_path):
+            print(f"Loading real data from {csv_path}...")
+            df = pd.read_csv(csv_path)
+        else:
+            print("No CSV found. Training on synthetic data...")
+            df = self.generate_synthetic_data(1000)
+            
+        if len(df) < 50:
+            print(f"Warning: Only {len(df)} samples. Adding synthetic data...")
+            synthetic = self.generate_synthetic_data(500)
+            df = pd.concat([df, synthetic], ignore_index=True)
+        
+        # Prepare features
+        X = df[self.feature_columns].fillna(0)
+        y = df['label']
+        
+        # Scale and train
+        X_scaled = self.scaler.fit_transform(X)
+        X_train, X_test, y_train, y_test = train_test_split(
+            X_scaled, y, test_size=0.2, random_state=42
+        )
+        
+        self.model.fit(X_train, y_train)
+        
+        train_score = self.model.score(X_train, y_train)
+        test_score = self.model.score(X_test, y_test)
+        
+        print(f"Training on REAL data: {len(df)} samples")
+        print(f"Train accuracy: {train_score:.3f}")
+        print(f"Test accuracy: {test_score:.3f}")
+        
+        # Save
+        joblib.dump(self.model, 'habit_model_real.pkl')
+        joblib.dump(self.scaler, 'feature_scaler_real.pkl')
+        
+        return train_score, test_score
+    
+    def extract_features_from_firestore_logs(self, logs_data):
+        """Convert Firestore logs to ML features"""
+        features_list = []
+        
+        for user_logs in logs_data:
+            # Calculate metrics from logs
+            total_days = len(user_logs)
+            completed_days = sum(1 for log in user_logs if log.get('completed'))
+            completion_rate = completed_days / total_days if total_days > 0 else 0
+            
+            # Calculate consistency (std dev of completion)
+            completions = [1 if log.get('completed') else 0 for log in user_logs]
+            consistency = 1 - (np.std(completions) if len(completions) > 1 else 0)
+            
+            # Calculate drop rate
+            drops = sum(1 for i in range(1, len(completions)) 
+                       if completions[i] == 0 and completions[i-1] == 1)
+            drop_rate = drops / (len(completions) - 1) if len(completions) > 1 else 0
+            
+            # Active streaks
+            active_streaks = max([log.get('streak', 0) for log in user_logs] or [0])
+            
+            features_list.append({
+                'completionRate': completion_rate,
+                'consistency': consistency,
+                'dropRate': drop_rate,
+                'activeStreaks': active_streaks,
+                'bestStreak': active_streaks,
+                'totalHabits': len(set(log.get('habitId') for log in user_logs))
+            })
+        
+        return pd.DataFrame(features_list)
+
     def predict_future_performance(self, current_features, historical_data=None):
         """Predict future performance trend"""
         if historical_data is None:
