@@ -2,8 +2,12 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import os
 import sys
+import threading
+import time
+from datetime import datetime
 from behavioral_ai_fixed_clean import BehavioralAIEngine
 from train_model import HabitModelTrainer
+from rl_engine_numpy import RLEngine, get_rl_engine, SUGGESTIONS, get_suggestion_text, detect_missing_categories
 import traceback
 
 # Windows consoles can default to cp1252 which crashes on Arabic prints.
@@ -22,11 +26,21 @@ CORS(app)
 @app.route("/")
 def home():
     return {
-        "message": "AI Backend is running ",
+        "message": "AI Backend is running with RL support",
         "endpoints": [
             "/health",
             "/analyze",
-            "/smart_suggest"
+            "/smart_suggest",
+            "/smart_suggest_rl",
+            "/feedback",
+            "/rl_stats",
+            "/rl_train"
+        ],
+        "features": [
+            "rule_based_suggestions",
+            "rl_q_learning",
+            "feedback_loop",
+            "experience_replay"
         ]
     }
 
@@ -36,12 +50,29 @@ CORS(app, resources={r"/*": {"origins": "*"}})
 # Initialize components
 behavioral_engine = None
 model_trainer = None
+rl_engine = None
 
 # Auto-learning tracking
 learning_data = []
 retrain_threshold = 1000
 last_retrain_count = 0
 last_retrain_date = None
+
+# RL Feedback tracking
+rl_feedback_buffer = []
+rl_last_training = time.time()
+RL_TRAINING_INTERVAL = 300  # 5 minutes between training sessions
+
+def initialize_rl_engine():
+    """Initialize RL Engine"""
+    global rl_engine
+    try:
+        rl_engine = get_rl_engine()
+        print(f"✅ RL Engine initialized: epsilon={rl_engine.epsilon:.3f}")
+        return True
+    except Exception as e:
+        print(f"❌ RL Engine initialization failed: {e}")
+        return False
 
 # 🗺 1️⃣ One-Hot Suggestion Mapping
 SUGGESTIONS = [
@@ -72,7 +103,11 @@ def initialize_system():
         
         # Initialize behavioral AI engine
         behavioral_engine = BehavioralAIEngine()
-        print("Behavioral AI system initialized successfully")
+        
+        # Initialize RL Engine
+        initialize_rl_engine()
+        
+        print("✅ All AI systems initialized successfully")
         return True
     except Exception as e:
         print(f"System initialization failed: {str(e)}")
@@ -919,6 +954,249 @@ def check_and_retrain():
                     client.post('/retrain_model')
     except Exception as e:
         print(f"Auto-retrain error: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════
+# RL (REINFORCEMENT LEARNING) ENDPOINTS
+# ═══════════════════════════════════════════════════════════════
+
+@app.route('/smart_suggest_rl', methods=['POST'])
+def smart_suggest_rl():
+    """
+    RL-based smart suggestion using Q-Learning
+    Returns suggestion based on learned Q-values
+    """
+    try:
+        data = request.get_json()
+        
+        # Get features from request
+        features = {
+            'completion_rate': float(data.get('completion_rate', 0)),
+            'consistency': float(data.get('consistency', 0)),
+            'drop_rate': float(data.get('drop_rate', 0)),
+            'active_streaks': float(data.get('activeStreaks', 0)),
+            'best_streak': float(data.get('bestStreak', 0)),
+            'total_habits': float(data.get('totalHabits', 0)),
+            'hour': datetime.now().hour,
+            'day_of_week': datetime.now().weekday(),
+            'is_weekend': datetime.now().weekday() >= 5,
+            'previous_completion': float(data.get('previous_completion', 0)),
+            'trend_7d': float(data.get('trend_7d', 0)),
+            'trend_30d': float(data.get('trend_30d', 0))
+        }
+        
+        # Get available suggestions
+        habit_names = data.get('habit_names', [])
+        available = detect_missing_categories(habit_names)
+        if not available:
+            available = SUGGESTIONS
+        
+        # Get state vector
+        state = rl_engine.get_state_vector(features)
+        
+        # Select action using RL policy
+        suggestion_id = rl_engine.select_action(state, available, explore=True)
+        
+        # Get Q-values for transparency
+        q_values = rl_engine.get_q_values(state)
+        top_q = sorted(q_values.items(), key=lambda x: x[1], reverse=True)[:3]
+        
+        return jsonify({
+            'suggestion_id': suggestion_id,
+            'suggestion_text': get_suggestion_text(suggestion_id),
+            'confidence': round(1.0 - rl_engine.epsilon, 3),
+            'exploration': rl_engine.epsilon > 0.1,
+            'method': 'rl_q_network',
+            'top_q_values': [
+                {'suggestion': k, 'q_value': round(v, 3)} for k, v in top_q
+            ],
+            'epsilon': round(rl_engine.epsilon, 3),
+            'engine_stats': rl_engine.get_stats()
+        })
+        
+    except Exception as e:
+        print(f"❌ RL Suggestion Error: {e}")
+        traceback.print_exc()
+        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
+
+
+@app.route('/feedback', methods=['POST'])
+def receive_feedback():
+    """
+    Receive user feedback for RL training
+    Stores experience (state, action, reward, next_state)
+    """
+    try:
+        data = request.get_json()
+        
+        # Required fields
+        user_id = data.get('userId', 'anonymous')
+        suggestion_id = data.get('suggestionId')
+        interaction = data.get('interaction')  # 'completed', 'opened', 'ignored', 'deleted', 'snoozed'
+        state_before = data.get('stateBefore', {})
+        state_after = data.get('stateAfter', {})
+        
+        if not suggestion_id or not interaction:
+            return jsonify({'error': 'Missing suggestionId or interaction'}), 400
+        
+        # Calculate reward
+        reward_map = {
+            'completed': 1.0,
+            'opened': 0.3,
+            'app_opened': 0.1,
+            'ignored': -0.2,
+            'deleted': -0.5,
+            'snoozed': -0.1
+        }
+        reward = reward_map.get(interaction, 0.0)
+        
+        # Convert to state vectors
+        state_vector = rl_engine.get_state_vector(state_before)
+        next_state_vector = rl_engine.get_state_vector(state_after)
+        
+        # Store experience
+        rl_engine.store_experience(
+            state=state_vector,
+            action=suggestion_id,
+            reward=reward,
+            next_state=next_state_vector,
+            done=False
+        )
+        
+        # Add to feedback buffer for batch processing
+        rl_feedback_buffer.append({
+            'user_id': user_id,
+            'suggestion_id': suggestion_id,
+            'reward': reward,
+            'timestamp': datetime.now().isoformat()
+        })
+        
+        # Trigger training if enough feedback
+        global rl_last_training
+        if len(rl_engine.replay_buffer) >= 32 and (time.time() - rl_last_training) > RL_TRAINING_INTERVAL:
+            print(f"🧠 Auto-training RL: {len(rl_engine.replay_buffer)} experiences")
+            loss = rl_engine.train_on_batch(num_steps=10)
+            rl_last_training = time.time()
+            
+            # Save periodically
+            if rl_engine.training_step % 100 == 0:
+                rl_engine.save_model()
+                print(f"💾 RL Model saved at step {rl_engine.training_step}")
+            
+            return jsonify({
+                'success': True,
+                'reward': reward,
+                'training_triggered': True,
+                'loss': round(loss, 6),
+                'buffer_size': len(rl_engine.replay_buffer),
+                'epsilon': round(rl_engine.epsilon, 3)
+            })
+        
+        return jsonify({
+            'success': True,
+            'reward': reward,
+            'training_triggered': False,
+            'buffer_size': len(rl_engine.replay_buffer),
+            'epsilon': round(rl_engine.epsilon, 3)
+        })
+        
+    except Exception as e:
+        print(f"❌ Feedback Error: {e}")
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/rl_stats', methods=['GET'])
+def rl_stats():
+    """Get RL engine statistics"""
+    try:
+        stats = rl_engine.get_stats()
+        stats['feedback_buffer_size'] = len(rl_feedback_buffer)
+        stats['rl_last_training'] = rl_last_training
+        stats['time_since_training'] = round(time.time() - rl_last_training, 0)
+        stats['suggestions_list'] = SUGGESTIONS
+        return jsonify(stats)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/rl_train', methods=['POST'])
+def rl_manual_train():
+    """Manually trigger RL training"""
+    try:
+        if len(rl_engine.replay_buffer) < 32:
+            return jsonify({
+                'error': 'Not enough experiences',
+                'buffer_size': len(rl_engine.replay_buffer),
+                'required': 32
+            }), 400
+        
+        steps = request.json.get('steps', 50)
+        losses = []
+        
+        for i in range(steps):
+            loss = rl_engine.train_step()
+            if loss is not None:
+                losses.append(loss)
+        
+        avg_loss = np.mean(losses) if losses else 0.0
+        
+        # Update target network
+        rl_engine.update_target_network()
+        
+        # Save model
+        rl_engine.save_model()
+        
+        global rl_last_training
+        rl_last_training = time.time()
+        
+        return jsonify({
+            'success': True,
+            'steps_trained': steps,
+            'average_loss': round(avg_loss, 6),
+            'final_epsilon': round(rl_engine.epsilon, 3),
+            'training_step': rl_engine.training_step,
+            'buffer_size': len(rl_engine.replay_buffer)
+        })
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/rl_qvalues', methods=['POST'])
+def rl_qvalues():
+    """Get Q-values for a given state (for debugging)"""
+    try:
+        data = request.get_json()
+        features = {
+            'completion_rate': float(data.get('completion_rate', 0)),
+            'consistency': float(data.get('consistency', 0)),
+            'drop_rate': float(data.get('drop_rate', 0)),
+            'active_streaks': float(data.get('activeStreaks', 0)),
+            'best_streak': float(data.get('bestStreak', 0)),
+            'total_habits': float(data.get('totalHabits', 0)),
+            'hour': data.get('hour', datetime.now().hour),
+            'day_of_week': data.get('day_of_week', datetime.now().weekday()),
+            'is_weekend': data.get('is_weekend', datetime.now().weekday() >= 5),
+            'previous_completion': float(data.get('previous_completion', 0)),
+            'trend_7d': float(data.get('trend_7d', 0)),
+            'trend_30d': float(data.get('trend_30d', 0))
+        }
+        
+        state = rl_engine.get_state_vector(features)
+        q_values = rl_engine.get_q_values(state)
+        
+        return jsonify({
+            'features': features,
+            'state_vector': state.tolist(),
+            'q_values': q_values,
+            'best_action': max(q_values.items(), key=lambda x: x[1]),
+            'epsilon': rl_engine.epsilon
+        })
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 
 if __name__ == '__main__':
     if initialize_system():
