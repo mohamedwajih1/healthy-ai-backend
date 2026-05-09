@@ -92,7 +92,7 @@ class BehavioralAIEngine:
         """Initialize and train the behavioral prediction model"""
         # Generate synthetic training data
         np.random.seed(42)
-        n_samples = 1000
+        n_samples = 3000  # Increased to reduce overfitting
         
         # Features: completionRate, consistency, dropRate, activeStreaks, bestStreak, totalHabits
         X = np.random.rand(n_samples, 6)
@@ -109,7 +109,14 @@ class BehavioralAIEngine:
         # Train model
         self.scaler.fit(X)
         X_scaled = self.scaler.transform(X)
-        self.model = RandomForestClassifier(n_estimators=100, random_state=42)
+        self.model = RandomForestClassifier(
+            n_estimators=100, 
+            random_state=42, 
+            class_weight='balanced',
+            max_depth=10,
+            min_samples_split=10,
+            min_samples_leaf=5
+        )
         self.model.fit(X_scaled, y)
     
     def _generate_behavior_labels(self, X):
